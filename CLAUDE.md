@@ -30,10 +30,17 @@ doing the full work. So the fixes that pay are the ones that stop calls being
 made at all, or cut per-response CPU. Micro-tuning a single handler will not
 show up.
 
-`v3.4.1-adam.1` was A/B'd against production on the owner's own hardware and
-won on every metric that is immune to machine noise — see "Verified on the
-owner's deployment" in `PERF_NOTES.md`. Changes 1-6 are in that image; change 7
-is newer and **has not yet been tested on the owner's deployment**.
+All seven changes are verified on the owner's own hardware. `v3.4.1-adam.6`
+was A/B'd against production and improved **every percentile** of server wait
+with no crossover (p10 -33% through p99 -14%), cut total server wait by **51%**,
+and shortened the home-page burst from 6.94 s to **4.17 s** with a matching call
+composition. See "Verified on the owner's deployment, round 2" in
+`PERF_NOTES.md`.
+
+When capturing a HAR for comparison, **check no scheduled job is running on the
+test container**. One capture was contaminated exactly that way and produced a
+misleading split result — better in the middle of the distribution, worse at
+both ends.
 
 Best remaining leads, in order:
 

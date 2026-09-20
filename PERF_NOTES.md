@@ -378,7 +378,7 @@ permission change, so it is left alone pending a decision.
 
 ---
 
-## Verified on the owner's deployment (2026-09-20)
+## Verified on the owner's deployment, round 1 — `v3.4.1-adam.1` (2026-09-20)
 
 `v3.4.1-adam.1` was run beside production on the same host, from a copy of the
 production volume, and both were captured as HARs through the same Cloudflare
@@ -446,6 +446,87 @@ re-captured, which is real downtime and was not done.
 Note also that 129 of 147 production responses were `304 Not Modified` (89 of
 104 on the test build) — the server still does the full job before the ETag
 comparison, so a 304 costs as much as a 200.
+
+---
+
+## Verified on the owner's deployment, round 2 — `v3.4.1-adam.6` (2026-09-20)
+
+Second A/B, same protocol as round 1 and now covering all seven changes. Same
+host, a copy of the production volume, both sides captured through the same
+Cloudflare path so the transport matches. Production was captured with the test
+container paused and so had the host's 4 vCPUs to itself; the test build was
+captured while production kept running, so the handicap again runs against it.
+
+Two captures were taken. The first is **discarded as contaminated**: the owner
+observed a scheduled job running on the test container during it, and its
+numbers carry the signature — the test build won the middle of the distribution
+(p50 -25%, p75 -49%) while losing both ends (p25 +44%, p95 +45%), which is what
+a scan saturating the event loop mid-capture produces. Its structural result
+still reproduced exactly (`/request/:id` 30 -> 0), and its aggregate still
+favoured the new build (total wait -33%, calls over 2s 37% -> 20%), but nothing
+percentile-based from it is trustworthy.
+
+The second capture, with no job running, is clean.
+
+### Whole session
+
+Every percentile improved, with no crossover:
+
+| | prod v3.4.1 | test adam.6 | |
+|---|---|---|---|
+| p10 | 329 ms | 219 ms | -33% |
+| p25 | 785 ms | 354 ms | -55% |
+| p50 | 2302 ms | 1314 ms | -43% |
+| p75 | 3780 ms | 2607 ms | -31% |
+| p90 | 4501 ms | 3043 ms | -32% |
+| p95 | 4902 ms | 3700 ms | -25% |
+| p99 | 5319 ms | 4564 ms | -14% |
+| total server wait | 543.1 s | **263.9 s** | **-51%** |
+| calls over 2 s | 123/229 (54%) | 65/166 (39%) | |
+| total `/api/v1/` calls | 229 | 166 | |
+
+### The home-page burst
+
+Composition matches apart from the ten calls removed by change 4 and one title
+lookup, so this is a controlled comparison:
+
+| | prod | test | |
+|---|---|---|---|
+| calls in burst | 36 | 25 | -31% |
+| peak concurrency | 31 | 21 | -32% |
+| end-to-end | 6.94 s | **4.17 s** | **-40%** |
+| slowest call | 6808 ms | 3043 ms | -55% |
+
+### Same-endpoint medians
+
+`/discover/trending` -50%, `/discover/genreslider/movie` -44%,
+`/tv/:id/similar` -42%, `/discover/movies` -41%, `/auth/me` -38%,
+`/movie/:id` -37%, `/tv/:id/recommendations` -36%, `/tv/:id` -33%,
+`/discover/tv` -31%, `/settings/discover` -19%.
+
+Five endpoints show a worse median: `/status` +53%, `/movie/:id/similar` +34%,
+`/settings/sonarr` +30%, `/media` +19%, `/request` +9%. All have between two and
+seven samples, and in every one of them the new build has the **better worst
+case** — the median ticks up while the tail collapses:
+
+    /request   prod [457,621,1862,1886,2685,3444,4903]   test [172,475,1966,2064,2319,2492]
+    /media     prod [1361,1483,1760,2302,3805]           test [1668,1732,2091,2095]
+    /status    prod [142,342,355,1130,1205]              test [157,544,577]
+
+That is what less event-loop contention looks like, not a regression.
+
+### What this does and does not establish
+
+`/request/:id` going 30 -> 0 is structural and reproduced in every capture.
+The burst numbers are trustworthy here because the composition matches. The
+percentile improvements are consistent and monotonic, which the round 1 and
+contaminated-capture numbers were not.
+
+Still not controlled for: the production container had been up for hours with a
+warm TMDB cache against a much younger test container, and the navigation was
+driven by hand rather than scripted. Both of those cut against the new build in
+the tail, so the figures above are more likely understated than overstated —
+but they remain a hand-driven comparison, not a benchmark.
 
 ---
 
