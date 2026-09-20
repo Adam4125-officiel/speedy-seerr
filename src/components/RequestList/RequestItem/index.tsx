@@ -315,6 +315,11 @@ const RequestItem = ({ request, revalidateList }: RequestItemProps) => {
     NonFunctionProperties<MediaRequest>
   >(`/api/v1/request/${request.id}`, {
     fallbackData: request,
+    // The parent list request already returned this exact object, so the
+    // mount-time revalidation refetches data we have. Approve/decline and
+    // delete still revalidate explicitly, and an in-progress download still
+    // polls through refreshInterval below.
+    revalidateOnMount: false,
     refreshInterval: refreshIntervalHelper(
       {
         downloadStatus: request.media.downloadStatus,
