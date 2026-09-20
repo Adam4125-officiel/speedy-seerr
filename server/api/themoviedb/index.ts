@@ -332,7 +332,7 @@ class TheMovieDb extends ExternalAPI implements TvShowProvider {
     language?: string;
   }): Promise<TmdbMovieDetails> => {
     try {
-      const data = await this.get<TmdbMovieDetails>(
+      let data = await this.get<TmdbMovieDetails>(
         `/movie/${movieId}`,
         {
           params: {
@@ -342,7 +342,8 @@ class TheMovieDb extends ExternalAPI implements TvShowProvider {
             include_video_language: language,
           },
         },
-        43200
+        43200,
+        { shared: true }
       );
 
       if (
@@ -373,9 +374,14 @@ class TheMovieDb extends ExternalAPI implements TvShowProvider {
             ) ?? [];
 
           if (englishFallbackTrailers.length > 0) {
-            data.videos = {
-              ...(data.videos ?? { results: [] }),
-              results: [...localizedVideos, ...englishFallbackTrailers],
+            // A copy rather than an assignment: `data` may be a cache entry
+            // shared with other callers.
+            data = {
+              ...data,
+              videos: {
+                ...(data.videos ?? { results: [] }),
+                results: [...localizedVideos, ...englishFallbackTrailers],
+              },
             };
           }
         } catch {
@@ -399,6 +405,7 @@ class TheMovieDb extends ExternalAPI implements TvShowProvider {
     includeVideoLanguage,
     ttl,
     cache,
+    shared,
   }: {
     tvId: number;
     language?: string;
@@ -406,6 +413,7 @@ class TheMovieDb extends ExternalAPI implements TvShowProvider {
     includeVideoLanguage?: string;
     ttl: number;
     cache?: CacheStore;
+    shared?: boolean;
   }): Promise<T> =>
     this.get<T>(
       `/tv/${tvId}`,
@@ -419,7 +427,7 @@ class TheMovieDb extends ExternalAPI implements TvShowProvider {
         },
       },
       ttl,
-      { cache, transform: stripUnreadTvCredits }
+      { cache, transform: stripUnreadTvCredits, shared }
     );
 
   public getTvShow = async ({
@@ -430,12 +438,13 @@ class TheMovieDb extends ExternalAPI implements TvShowProvider {
     language?: string;
   }): Promise<TmdbTvDetails> => {
     try {
-      const data = await this.getTvShowDetails<TmdbTvDetails>({
+      let data = await this.getTvShowDetails<TmdbTvDetails>({
         tvId,
         language,
         appendToResponse: TV_DETAILS_APPEND_TO_RESPONSE,
         includeVideoLanguage: language,
         ttl: TV_DETAILS_TTL,
+        shared: true,
       });
 
       if (
@@ -462,9 +471,14 @@ class TheMovieDb extends ExternalAPI implements TvShowProvider {
             ) ?? [];
 
           if (englishFallbackTrailers.length > 0) {
-            data.videos = {
-              ...(data.videos ?? { results: [] }),
-              results: [...localizedVideos, ...englishFallbackTrailers],
+            // A copy rather than an assignment: `data` may be a cache entry
+            // shared with other callers.
+            data = {
+              ...data,
+              videos: {
+                ...(data.videos ?? { results: [] }),
+                results: [...localizedVideos, ...englishFallbackTrailers],
+              },
             };
           }
         } catch {
@@ -520,17 +534,24 @@ class TheMovieDb extends ExternalAPI implements TvShowProvider {
             language,
             append_to_response: 'external_ids',
           },
-        }
+        },
+        undefined,
+        { shared: true }
       );
 
-      data.episodes = data.episodes.map((episode) => {
-        if (episode.still_path) {
-          episode.still_path = `https://image.tmdb.org/t/p/original/${episode.still_path}`;
-        }
-        return episode;
-      });
-
-      return data;
+      // Copies rather than in-place edits: `data` may be a cache entry shared
+      // with other callers, and prefixing a path twice would corrupt it.
+      return {
+        ...data,
+        episodes: data.episodes.map((episode) =>
+          episode.still_path
+            ? {
+                ...episode,
+                still_path: `https://image.tmdb.org/t/p/original/${episode.still_path}`,
+              }
+            : episode
+        ),
+      };
     } catch (e) {
       throw new Error(`[TMDB] Failed to fetch TV show details: ${e.message}`, {
         cause: e,

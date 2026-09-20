@@ -56,11 +56,20 @@ class ExternalAPI {
   }
 
   // transform runs before the cache write.
+  //
+  // `shared` hands every reader the same frozen object instead of copying it
+  // out of the cache. Only pass it where the caller is known not to mutate the
+  // result: the copy is what protects the entry, and a write to a frozen object
+  // throws.
   protected async get<T>(
     endpoint: string,
     config?: AxiosRequestConfig,
     ttl?: number,
-    options?: { cache?: CacheStore; transform?: (data: T) => T }
+    options?: {
+      cache?: CacheStore;
+      transform?: (data: T) => T;
+      shared?: boolean;
+    }
   ): Promise<T> {
     const cache = options?.cache ?? this.cache;
     const cacheKey = this.serializeCacheKey(endpoint, {
@@ -78,7 +87,7 @@ class ExternalAPI {
       : response.data;
 
     if (cache && ttl !== 0) {
-      cache.set(cacheKey, data, ttl ?? DEFAULT_TTL);
+      cache.set(cacheKey, data, ttl ?? DEFAULT_TTL, options?.shared);
     }
 
     return data;

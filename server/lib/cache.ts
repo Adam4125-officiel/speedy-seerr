@@ -58,7 +58,7 @@ export interface CacheStats {
 
 export interface CacheStore {
   get<T>(key: string): T | undefined;
-  set<T>(key: string, value: T, ttl?: number): boolean;
+  set<T>(key: string, value: T, ttl?: number, shared?: boolean): boolean;
   del(key: string): number;
   getTtl(key: string): number | undefined;
   getStats(): CacheStats;
@@ -98,7 +98,30 @@ interface LruEntry {
   value: unknown;
   ksize: number;
   vsize: number;
+  shared: boolean;
 }
+
+// Entries stored as shared are handed to every reader without copying, so they
+// are frozen to turn an accidental write into an immediate TypeError rather
+// than silent cross-request corruption. Tracks seen objects so a cyclic
+// payload cannot loop forever.
+const deepFreeze = <T>(value: T, seen = new WeakSet<object>()): T => {
+  if (value === null || typeof value !== 'object') {
+    return value;
+  }
+
+  const obj = value as object;
+  if (seen.has(obj)) {
+    return value;
+  }
+  seen.add(obj);
+
+  for (const key of Object.keys(obj)) {
+    deepFreeze((obj as Record<string, unknown>)[key], seen);
+  }
+
+  return Object.freeze(value);
+};
 
 class LruCacheStore implements CacheStore {
   private cache: LRUCache<string, LruEntry>;
@@ -123,8 +146,9 @@ class LruCacheStore implements CacheStore {
     });
   }
 
-  // Cloned on read because callers mutate what they get back, as getTvSeason
-  // does when it rewrites still_path in place.
+  // Cloned on read by default, because callers may mutate what they get back.
+  // Entries written as shared skip that copy: they are frozen at write time and
+  // the same object is handed to every reader.
   public get<T>(key: string): T | undefined {
     const entry = this.cache.get(key);
 
@@ -134,14 +158,18 @@ class LruCacheStore implements CacheStore {
     }
 
     this.hits++;
-    return structuredClone(entry.value) as T;
+    return entry.shared
+      ? (entry.value as T)
+      : (structuredClone(entry.value) as T);
   }
 
-  public set<T>(key: string, value: T, ttl?: number): boolean {
+  public set<T>(key: string, value: T, ttl?: number, shared = false): boolean {
+    const stored = structuredClone(value);
     const entry: LruEntry = {
-      value: structuredClone(value),
+      value: shared ? deepFreeze(stored) : stored,
       ksize: keyLength(key),
       vsize: valueLength(value),
+      shared,
     };
 
     // A ttl of 0 means the entry never expires.
