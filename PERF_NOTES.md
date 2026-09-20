@@ -330,10 +330,12 @@ the test container frozen (`docker pause`), so it had the host's 4 vCPUs to
 itself. The test build was captured while production kept running, competing for
 the same cores.
 
-The owner performed the **same sequence of navigations** in both captures,
+The owner performed the same sequence of navigations in both captures, by hand,
 waiting for the UI to finish rendering before each move. The session lengths
-therefore differ as a *result*, not as a sampling difference: the same actions
-took **38.3 s on production and 28.2 s on this build**. The same fact explains
+therefore differ largely as a *result* rather than as a sampling difference —
+the same actions took 38.3 s on production and 28.2 s on this build — but this
+was a human driving a browser, not a scripted run, so treat that pair as
+indicative of direction and rough scale only, never as a measurement. The same fact explains
 why production issued more `/movie/:id` (26 vs 21) and `/tv/:id` (13 vs 8)
 lookups — those are lazy `inView` fetches from request cards, so a page that
 takes longer to settle brings more cards into view and fires more of them.
@@ -405,12 +407,43 @@ database is small enough that query shape is not the bottleneck: 523 `media`,
 269 `media_request`, 410 `season`, 74 `watchlist`, 10 `user`. Database work was
 deprioritised on that evidence.
 
-### `/api/v1/discover/watchlist` is now the slowest endpoint
+### `/api/v1/discover/watchlist` — measured, it is a victim not a cause
 
-After the changes above it is the worst single endpoint on the owner's
-deployment: **3013 ms median server wait**, even having improved 30% from
-4307 ms. It is the largest remaining user-visible cost and the next thing to
-investigate. Not yet looked at.
+The HAR makes it look like the worst endpoint on the deployment: 3013 ms median
+server wait, the slowest single call, even after improving 30% from 4307 ms. It
+was promoted to "next target" on that basis, and **measurement overturned it.**
+
+Reproduced on the owner's code path (Jellyfin user, so no `plexToken`, which
+takes the local database branch rather than the Plex one) with 20 watchlist rows:
+
+| | |
+|---|---|
+| median, isolated | **23.3 ms** (min 16.8, max 46.5) |
+| for scale, `/request?take=20` | 20.7 ms |
+| payload | 33.1 KB for 20 items |
+
+So it is an ordinary endpoint. Its 3013 ms in the HAR is queueing behind the
+home-page burst, not work it does itself — it is issued early in the burst and
+served late. Chasing it would have bought nothing.
+
+Two real observations remain, neither actionable under the hard rules:
+
+- The response carries far more than the documented contract. `seerr-api.yml`
+  declares each item as `tmdbId`, `ratingKey`, `type`, `title`, but the local
+  branch returns whole entities — `requestedBy` (User plus its eager
+  `settings`) and `media` (Media plus its eager `seasons`) — because both
+  relations on `Watchlist` are `eager: true`, and TypeORM's `find` always loads
+  eager relations regardless of the `relations` option. Hence 33 KB for 20 rows.
+- The two branches of this route disagree: the Plex branch maps down to
+  `{id, ratingKey, title, mediaType, tmdbId}` while the local branch returns
+  full entities.
+
+Trimming the local branch to match the spec would cut the payload substantially
+and drop three eager joins, but it removes fields that are in the response
+today, which is a **public API shape change** and therefore blocked by hard
+rule 4. Switching to QueryBuilder (which ignores eager relations) has the same
+effect. Not implemented. It would need the owner's decision, since it is only
+safe if nothing external consumes those undocumented fields.
 
 ### `/discover/genreslider/*` issues ~20 TMDB calls per request
 
