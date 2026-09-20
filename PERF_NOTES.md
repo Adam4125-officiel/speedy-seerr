@@ -318,6 +318,75 @@ permission change, so it is left alone pending a decision.
 
 ---
 
+## Verified on the owner's deployment (2026-09-20)
+
+`v3.4.1-adam.1` was run beside production on the same host, from a copy of the
+production volume, and both were captured as HARs through the same Cloudflare
+path (`seerr.adrrrr.com` vs `test-seerr.adrrrr.com`, both h3/HTTP2), so the
+transport is symmetric.
+
+**The comparison is biased against this build.** Production was captured with
+the test container frozen (`docker pause`), so it had the host's 4 vCPUs to
+itself. The test build was captured while production kept running, competing for
+the same cores.
+
+The owner performed the **same sequence of navigations** in both captures,
+waiting for the UI to finish rendering before each move. The session lengths
+therefore differ as a *result*, not as a sampling difference: the same actions
+took **38.3 s on production and 28.2 s on this build**. The same fact explains
+why production issued more `/movie/:id` (26 vs 21) and `/tv/:id` (13 vs 8)
+lookups — those are lazy `inView` fetches from request cards, so a page that
+takes longer to settle brings more cards into view and fires more of them.
+
+### The home-page burst
+
+The two bursts are compositionally identical apart from the ten calls removed by
+change 4, which makes this a well-controlled comparison:
+
+    prod: /request/:id×10  /movie/:id×10 /tv/:id×4 /auth/me×2 ...  = 34 calls
+    test:                  /movie/:id×10 /tv/:id×4 /auth/me×2 ...  = 24 calls
+
+| | prod v3.4.1 | test adam.1 | |
+|---|---|---|---|
+| calls in burst | 34 | 24 | -29% |
+| peak concurrency | 31 | 21 | -32% |
+| burst end-to-end | 6.92 s | **5.09 s** | **-26%** |
+| slowest call in burst | 5538 ms | 3989 ms | -28% |
+
+### Whole session
+
+| | prod | test |
+|---|---|---|
+| wall time for the same navigation sequence | 38.3 s | **28.2 s** |
+| `/api/v1/request/:id` calls | 30 | **0** |
+| total `/api/v1/` calls | 147 | 104 |
+| median server wait per call | 1441 ms | 766 ms |
+| p95 server wait | 4862 ms | 3524 ms |
+
+Same-endpoint median wait, both sides n>=2: genreslider/tv -62%,
+settings/discover -52%, genreslider/movie -51%, discover/watchlist -30%,
+discover/tv -32%, auth/me -25%, movie/:id -22%, trending -20%, request -11%.
+Flat or marginally worse: discover/movies +5%, media +14%, tv/:id +1%, status
+-3% — noise, and measured under contention.
+
+### What these numbers do and do not prove
+
+The **call-count reductions are structural and certain**: 30 `/request/:id`
+calls disappear because the component no longer makes them, which no amount of
+machine noise can produce.
+
+The **latency percentages are confounded** and should be read as indicative, not
+exact. Production had been up three days with an accumulated heap; the test
+container was minutes old, and a fresh Node process is faster for reasons this
+fork did not earn. Pulling that apart needs production restarted and
+re-captured, which is real downtime and was not done.
+
+Note also that 129 of 147 production responses were `304 Not Modified` (89 of
+104 on the test build) — the server still does the full job before the ETag
+comparison, so a 304 costs as much as a 200.
+
+---
+
 ## Proposed, not implemented
 
 Things that would help but break a hard rule, or that measurement did not
@@ -335,6 +404,13 @@ No schema change is needed or proposed. Separately, the owner's production
 database is small enough that query shape is not the bottleneck: 523 `media`,
 269 `media_request`, 410 `season`, 74 `watchlist`, 10 `user`. Database work was
 deprioritised on that evidence.
+
+### `/api/v1/discover/watchlist` is now the slowest endpoint
+
+After the changes above it is the worst single endpoint on the owner's
+deployment: **3013 ms median server wait**, even having improved 30% from
+4307 ms. It is the largest remaining user-visible cost and the next thing to
+investigate. Not yet looked at.
 
 ### `/discover/genreslider/*` issues ~20 TMDB calls per request
 
