@@ -116,6 +116,63 @@ The first session already did the groundwork. In a fresh Codespace:
 - `next telemetry disable` (a `postinstall` script) creates an untracked
   `cache/` directory at the repo root. Leave it; never commit it.
 
+## Rebasing onto a newer upstream
+
+This fork exists to be rebased. The whole diff is small on purpose: **11 files
+under `server/` and `src/`, +167/-92**, no migrations, no entity columns.
+
+```bash
+git fetch upstream --tags
+git checkout develop && git reset --hard upstream/develop   # mirror, never commit here
+git checkout adam
+git rebase upstream/develop
+```
+
+### Where conflicts are expected, and how to resolve them
+
+| File | Why | Resolution |
+|---|---|---|
+| `server/api/themoviedb/index.ts` | changes 2 and 7 both touch it; most likely conflict | keep ours, re-audit (below) |
+| `server/lib/cache.ts` | change 7 | keep the `shared`/`deepFreeze` logic |
+| `server/index.ts` | change 6 deleted a middleware | **check it has not come back** |
+| `src/pages/_app.tsx` | change 3 | keep the parallel fetch |
+| `.github/workflows/*.yml` | the `if:` repository guards | keep the guard, take upstream's other edits |
+
+If upstream has fixed one of these themselves, **drop our commit** rather than
+forcing ours in. Check before assuming: `git log upstream/develop --oneline -20`.
+
+### Mandatory post-rebase checks
+
+1. **Re-audit the change 7 hazard.** `getMovie`, `getTvShow` and `getTvSeason`
+   hand out **frozen, shared** cache entries. Confirm none of them, and nothing
+   new that consumes them, mutates the result — a write to a frozen object
+   throws. The audit that justified this is in `PERF_NOTES.md` under change 7.
+   Re-run it:
+
+   ```bash
+   grep -nE "^\s+(data|show|movie|tv|season)\.[A-Za-z_]+\s*=[^=]" server/api/themoviedb/index.ts
+   grep -rnE "^\s+[a-z][A-Za-z]*\.[A-Za-z_]+\s*=[^=>]" server/models/ server/routes/ --include=*.ts | grep -v test
+   ```
+
+2. **Confirm the `res.json` round-trip has not returned** to `server/index.ts`.
+   If upstream enables `validateResponses`, change 6 must be reverted — the
+   middleware exists for that, and the rationale for removing it was that
+   response validation is off.
+
+3. **Check the migration delta** before shipping, since it decides whether a
+   rollback is possible by swapping the image:
+
+   ```bash
+   ls server/migration/sqlite/ | wc -l    # compare against the deployment's count
+   ```
+
+4. Run the full validation suite, then re-measure with `perf/`. Do not assume
+   the old numbers still hold — upstream may have fixed or changed any of these
+   paths.
+
+5. Rebuild the image and re-run the A/B in the runbook in `PERF_NOTES.md`
+   before the owner deploys it.
+
 ## Validation (run before every commit)
 
 ```bash
