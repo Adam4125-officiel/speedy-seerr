@@ -267,10 +267,27 @@ CoreApp.getInitialProps = async (initialProps) => {
   };
 
   if (ctx.res) {
-    // Check if app is initialized and redirect if necessary
-    const response = await axios.get<PublicSettingsResponse>(
-      `http://${getHostAndPort()}/api/v1/settings/public`
+    const host = getHostAndPort();
+
+    // Neither lookup depends on the other, so they are issued together rather
+    // than costing two sequential round trips on every server-rendered page.
+    // The user request resolves to undefined instead of rejecting, which keeps
+    // it handled even when the settings request is the one that fails.
+    const settingsPromise = axios.get<PublicSettingsResponse>(
+      `http://${host}/api/v1/settings/public`
     );
+    const userPromise = axios
+      .get<User>(`http://${host}/api/v1/auth/me`, {
+        headers:
+          ctx.req && ctx.req.headers.cookie
+            ? { cookie: ctx.req.headers.cookie }
+            : undefined,
+      })
+      .then((response) => response.data)
+      .catch(() => undefined);
+
+    // Check if app is initialized and redirect if necessary
+    const response = await settingsPromise;
 
     currentSettings = response.data;
 
@@ -284,26 +301,16 @@ CoreApp.getInitialProps = async (initialProps) => {
         ctx.res.end();
       }
     } else {
-      try {
-        // Attempt to get the user by running a request to the local api
-        const response = await axios.get<User>(
-          `http://${getHostAndPort()}/api/v1/auth/me`,
-          {
-            headers:
-              ctx.req && ctx.req.headers.cookie
-                ? { cookie: ctx.req.headers.cookie }
-                : undefined,
-          }
-        );
-        user = response.data;
+      user = await userPromise;
 
+      if (user) {
         if (router.pathname.match(/(setup|login)/)) {
           ctx.res.writeHead(307, {
             Location: '/',
           });
           ctx.res.end();
         }
-      } catch {
+      } else {
         // If there is no user, and ctx.res is set (to check if we are on the server side)
         // _AND_ we are not already on the login or setup route, redirect to /login with a 307
         // before anything actually renders
