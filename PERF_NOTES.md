@@ -576,6 +576,76 @@ Things that cannot be confirmed in this Codespace.
 
 ---
 
+## Runbook: testing a new image beside production
+
+This is how `v3.4.1-adam.1` was validated, and it worked cleanly. Repeat it for
+any later tag. Production keeps running throughout on its own volume; only a
+copy is ever written to. PowerShell, on the owner's VM.
+
+Quoting note: pass the whole `sh -c` script in **double** quotes with **single**
+quotes inside. Docker's Windows CLI strips inner double quotes, and `\"` is a
+bash escape that PowerShell does not honour — both mistakes were made here.
+
+**1. Pin the current image, because the deployment tracks the moving `:latest`.**
+
+    docker image inspect ghcr.io/seerr-team/seerr:latest --format "{{index .RepoDigests 0}}"
+    docker tag ghcr.io/seerr-team/seerr:latest seerr:rollback
+
+**2. Copy the volume with the container stopped** (~15 s downtime; copying a
+live SQLite file yields a corrupt copy):
+
+    docker volume create seerr-data-test
+    docker stop seerr
+    docker run --rm -v seerr-data:/from -v seerr-data-test:/to alpine sh -c "cp -a /from/. /to/"
+    docker start seerr
+
+**3. Verify the copy before trusting it.** Expect `ok`, and a migration count
+matching production, and no `-wal`/`-shm` files left behind:
+
+    docker run --rm -v seerr-data-test:/data alpine sh -c "apk add -q --no-cache sqlite && sqlite3 /data/db/db.sqlite3 'PRAGMA integrity_check;'"
+    docker run --rm -v seerr-data-test:/data alpine sh -c "apk add -q --no-cache sqlite && sqlite3 /data/db/db.sqlite3 'SELECT COUNT(*) FROM migrations;'"
+
+**4. Silence notifications on the copy.** It inherits the real `settings.json`,
+so without this it will email users and post to Discord:
+
+    docker run --rm -v seerr-data-test:/data alpine sh -c "apk add -q --no-cache jq && cp /data/settings.json /data/settings.json.orig && jq '.notifications.agents[].enabled = false' /data/settings.json > /data/settings.new && mv /data/settings.new /data/settings.json"
+    docker run --rm -v seerr-data-test:/data alpine sh -c "apk add -q --no-cache jq && jq .notifications.agents.email.enabled /data/settings.json"
+    docker run --rm -v seerr-data-test:/data alpine sh -c "apk add -q --no-cache jq && jq .notifications.agents.discord.enabled /data/settings.json"
+    docker run --rm -v seerr-data-test:/data alpine sh -c "apk add -q --no-cache jq && jq .notifications.agents.webpush.enabled /data/settings.json"
+
+**5. Start it beside production** — different name, port, volume, and not behind
+the reverse proxy. Mirror production's env (`TZ`, `LOG_LEVEL`); leave `NODE_ENV`
+and `COMMIT_TAG` alone, they are baked in:
+
+    docker run -d --name seerr-test -p 5056:5055 -v seerr-data-test:/app/config -e TZ=Europe/Paris -e LOG_LEVEL=debug ghcr.io/adam4125-officiel/seerr:<TAG>
+    docker logs -f seerr-test
+
+**6. Capture two HARs.** Getting this fair matters more than the capture itself:
+
+- **Same transport on both sides.** Comparing a proxied domain against
+  `localhost` measures Cloudflare, not the code. Either use two domains through
+  the same proxy, or `localhost` for both.
+- **Warm the new instance first.** Production has a days-old TMDB cache; a fresh
+  container has none, and cold misses are real network round trips. Load the
+  home page three or four times and click into a movie and a show before
+  capturing.
+- **Freeze the other container during each capture** (`docker pause seerr-test`
+  while capturing production). Both instances share 4 vCPUs and the whole
+  problem is event-loop saturation, so an unfrozen neighbour distorts the
+  result.
+- DevTools: tick **Preserve log** and **Disable cache**, hard-reload, wait for
+  the list to stop growing, then *Save all as HAR with content*.
+
+**7. Compare the right things.** Call counts are structural and immune to
+machine noise; wall-clock over a hand-driven session is indicative only. The
+numbers worth extracting are API calls per page load, total `wait` across
+`/api/v1/` entries, the width of the home-page burst, and peak concurrency.
+
+**Cleanup:** `docker stop seerr-test`. Left running it polls Radarr and Sonarr
+every 30 s alongside production.
+
+---
+
 ## Rolling back to the upstream image
 
 This fork adds **no migrations** and changes no entity columns — `git diff
