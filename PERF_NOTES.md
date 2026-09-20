@@ -279,6 +279,66 @@ Burst wall time, 10 rounds, two runs per arm: 364/372 ms → 338/328 ms
 removed middleware would have thrown a `SyntaxError` on — now behaves normally
 again.
 
+### 7. `perf(cache): hand the largest TMDB payloads out without copying them`
+
+**Problem.** `structuredClone` was 944 ms on a 30-request burst profile, the
+largest entry on the event loop that is not idle, program or GC, plus much of
+the 530 ms in GC because it allocates 170-360 KB per call.
+
+**Cause.** The cache copies on both read and write. The read copy is the
+expensive one — it is paid on every hit — and both were load-bearing, because
+three call sites mutated what `ExternalAPI.get` returned:
+
+- `getMovie` and `getTvShow` reassigned `data.videos` when merging English
+  fallback trailers.
+- `getTvSeason` rewrote `episode.still_path` in place, which without the copy
+  would prefix the same path on every hit and produce
+  `https://image.tmdb.org/t/p/original/https://image.tmdb.org/...`.
+
+**Fix.** Those three build new objects instead of mutating. An audit of every
+consumer of a cached value found no others — the Sonarr season mutation works
+on uncached responses fetched through raw axios, the scanner one works on
+TypeORM entities, the two `data.overview` writes in the movie and TV routes
+work on mapper output rather than the TMDB object, and the mappers construct
+new objects throughout.
+
+`ExternalAPI.get` then takes an opt-in `shared` flag, used only by `getMovie`,
+`getTvShow` and `getTvSeason`: the three biggest payloads and the three audited
+call sites. A shared entry is deep-frozen once at write time and handed to every
+reader without copying. Every other caller still gets a copy, unchanged.
+
+Opt-in rather than flipping the cache globally, because the copy is what makes
+an unaudited caller safe. Frozen rather than merely shared, so a mutation that
+slips in later throws a `TypeError` immediately instead of silently corrupting
+the entry for every other request.
+
+**Before / after.** CPU profile over an identical burst:
+
+| | Before | After |
+|---|---|---|
+| `structuredClone` | 944 ms | 310 ms (**-67%**) |
+| `deepFreeze` | 0 ms | 36 ms |
+| clone + freeze combined | 944 ms | **346 ms (-63%)** |
+| garbage collector | 530 ms | 360 ms (-32%) |
+| non-idle work | 4176 ms | 3620 ms (-13%) |
+
+Burst wall time, 10 rounds, two runs per arm: 371/330 ms -> 337/292 ms (-10%).
+
+`deepFreeze` costs far less than the cloning it replaces because it is paid once
+per cache write rather than on every read.
+
+**Verification.** Byte-for-byte across 31 endpoints: **31/31 identical**.
+Exercised over three passes of 117 requests covering movie, TV and season routes
+so passes 2 and 3 read frozen entries: all 200, no frozen-object errors. Full
+suite 189/189.
+
+**Risk: medium — the highest of any change here.** It rests on an audit rather
+than on a copy. If upstream later adds code that mutates the result of
+`getMovie`, `getTvShow` or `getTvSeason`, it will throw a `TypeError` instead of
+working. That is a loud, immediate failure rather than silent corruption, and
+the tests plus a response capture would catch it, but **re-check those three
+call sites after any rebase that touches `server/api/themoviedb/index.ts`.**
+
 ---
 
 ## Evidence from the owner's production instance
@@ -455,35 +515,12 @@ TTL for this endpoint would help, but the result is genre *artwork* that
 changes as titles trend, so a longer TTL is a visible behaviour change.
 **Not implemented** pending a decision from the owner.
 
-### `structuredClone` on every cache read and write — the largest single cost
+### `structuredClone` — done, see change 7
 
-`server/lib/cache.ts` clones on both `get` and `set`. Measured cost on real
-payloads: 0.16 ms for a discover page, 2.9 ms for a movie, **4.9 ms for a TV
-show**, so every cache *hit* on a TV detail page blocks the event loop for
-~5 ms.
-
-A CPU profile of the event loop over a 30-request burst puts it at **874 ms of
-12.1%**, the largest entry that is not idle, program or GC — and it drives a
-good share of the 500 ms (6.9%) spent in GC, since it allocates 170-360 KB per
-call. Together that is roughly a fifth of event-loop CPU.
-
-It is **not implemented** because both clones are load-bearing. Two callers
-mutate the object they get back from `ExternalAPI.get`:
-
-- `getTvSeason` rewrites `episode.still_path` in place, prefixing an image host.
-  Without the clone this would compound on every cache hit, producing
-  `https://image.tmdb.org/t/p/original/https://image.tmdb.org/...`.
-- `getMovie` assigns `data.videos` when merging English fallback trailers. Without
-  the clone the cached entry would accumulate those trailers, and the
-  `some(video => video.type === 'Trailer')` guard would then stop firing,
-  changing behaviour. This path is especially live for non-English installs; the
-  owner's is `fr`.
-
-The safe route is to make those two call sites build new objects instead of
-mutating, then add an opt-in "no clone" flag to `ExternalAPI.get` used only at
-call sites audited as read-only (the route mappers all construct new objects and
-would qualify). That is a real refactor with a real risk of missing a mutator,
-so it is left as a proposal rather than done blind.
+This was the largest single cost on the event loop and is now addressed by
+change 7 above, via an audited opt-in rather than by removing the copy
+globally. The remaining 310 ms of cloning belongs to the call sites that still
+copy, which is every consumer except the three biggest TMDB payloads.
 
 ### 982 KB client chunk — investigated, no action needed
 

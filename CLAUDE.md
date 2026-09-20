@@ -17,7 +17,7 @@ You are running in a fresh, empty GitHub Codespace. Nothing is preinstalled for 
 Work happens on `adam` (pushed to `origin`). `develop` mirrors upstream and is
 never committed to. `working_branch` is gone, locally and on the remote.
 
-Eight commits so far — six optimisations, all measured, plus the CI work.
+Seven optimisations so far, all measured, plus the CI work.
 `PERF_NOTES.md` is the source of truth for what changed, the before/after
 numbers, what was investigated and rejected, and what still needs checking on
 the real deployment. **Read it before starting anything.**
@@ -30,22 +30,38 @@ doing the full work. So the fixes that pay are the ones that stop calls being
 made at all, or cut per-response CPU. Micro-tuning a single handler will not
 show up.
 
+`v3.4.1-adam.1` was A/B'd against production on the owner's own hardware and
+won on every metric that is immune to machine noise — see "Verified on the
+owner's deployment" in `PERF_NOTES.md`. Changes 1-6 are in that image; change 7
+is newer and **has not yet been tested on the owner's deployment**.
+
 Best remaining leads, in order:
 
-1. **`structuredClone` in `server/lib/cache.ts`** — 12.1% of event-loop CPU plus
-   much of the 6.9% GC, the largest single cost left. Not safe to remove as-is:
-   `getTvSeason` and `getMovie` both mutate what `ExternalAPI.get` returns. The
-   route in `PERF_NOTES.md` is to make those two non-mutating first, then add an
-   opt-in no-clone flag for audited read-only call sites.
-2. **`/api/v1/discover/watchlist`** was the slowest slider call in the HAR at
-   1810 ms. Not yet investigated.
-3. **`/api/v1/auth/me` fetched 11 times in 27 s**, once per navigation. Raising
-   SWR's `dedupingInterval` in `useUser` to match its existing 30 s
-   `refreshInterval` would collapse most of them without weakening the freshness
-   the polling already guarantees — but it changes how fast a focus event picks
-   up a permission change, so it needs a decision first.
-4. **`/discover/genreslider/*`** issues ~20 TMDB calls per request, right at the
-   client's rate-limit cap.
+1. **`/api/v1/auth/me` fetched ~20 times per session**, once per navigation, all
+   adding to the burst. Raising SWR's `dedupingInterval` in `useUser` to match
+   its existing 30 s `refreshInterval` would collapse most of them without
+   weakening the freshness the polling already guarantees — but it changes how
+   fast a focus event picks up a permission change, **so ask the owner first.**
+2. **`/discover/genreslider/*`** issues ~20 TMDB calls per request, right at the
+   client's rate-limit cap. A longer TTL means visibly staler genre artwork, so
+   this also needs the owner's call.
+3. **`/discover/watchlist` payload** — returns whole User and Media entities
+   where `seerr-api.yml` documents four scalar fields, 33 KB for 20 rows.
+   Trimming it is a public API shape change, blocked by hard rule 4 unless the
+   owner authorises it.
+4. **304s.** 129 of 147 production responses were `304 Not Modified`, each
+   having done the full work before the ETag comparison. Unexamined, and likely
+   architectural.
+
+Do **not** re-investigate `/api/v1/discover/watchlist` as a slow endpoint. It
+looks like the worst one in the HAR at 3013 ms, but measured in isolation on the
+owner's code path it runs in 23 ms — it is queueing behind the burst, not slow.
+That is written up in `PERF_NOTES.md`.
+
+One standing hazard from change 7: `getMovie`, `getTvShow` and `getTvSeason`
+hand out **frozen, shared** cache entries. Anything that mutates their result
+will throw. **Re-check those three after any rebase touching
+`server/api/themoviedb/index.ts`.**
 
 ## Hard rules (never break these)
 
