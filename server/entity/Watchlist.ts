@@ -85,12 +85,6 @@ export class Watchlist implements WatchlistItem {
   }): Promise<Watchlist> {
     const watchlistRepository = getRepository(this);
     const mediaRepository = getRepository(Media);
-    const tmdb = new TheMovieDb();
-
-    const tmdbMedia =
-      watchlistRequest.mediaType === MediaType.MOVIE
-        ? await tmdb.getMovie({ movieId: watchlistRequest.tmdbId })
-        : await tmdb.getTvShow({ tvId: watchlistRequest.tmdbId });
 
     const existing = await watchlistRepository
       .createQueryBuilder('watchlist')
@@ -122,6 +116,15 @@ export class Watchlist implements WatchlistItem {
     });
 
     if (!media) {
+      // Only a media row we have never seen needs its details from TMDB, so the
+      // lookup happens here rather than up front, where duplicate watchlist
+      // entries and titles already in the library paid for it and threw it away.
+      const tmdb = new TheMovieDb();
+      const tmdbMedia =
+        watchlistRequest.mediaType === MediaType.MOVIE
+          ? await tmdb.getMovie({ movieId: watchlistRequest.tmdbId })
+          : await tmdb.getTvShow({ tvId: watchlistRequest.tmdbId });
+
       media = new Media({
         tmdbId: tmdbMedia.id,
         tvdbId: tmdbMedia.external_ids.tvdb_id,
