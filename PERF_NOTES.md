@@ -457,16 +457,34 @@ Cloudflare path so the transport matches. Production was captured with the test
 container paused and so had the host's 4 vCPUs to itself; the test build was
 captured while production kept running, so the handicap again runs against it.
 
-Two captures were taken. The first is **discarded as contaminated**: the owner
-observed a scheduled job running on the test container during it, and its
-numbers carry the signature — the test build won the middle of the distribution
-(p50 -25%, p75 -49%) while losing both ends (p25 +44%, p95 +45%), which is what
-a scan saturating the event loop mid-capture produces. Its structural result
-still reproduced exactly (`/request/:id` 30 -> 0), and its aggregate still
-favoured the new build (total wait -33%, calls over 2s 37% -> 20%), but nothing
+Two captures were taken. The first is **discarded as contaminated, confirmed
+from the container log rather than assumed**. Its numbers carried the signature
+of event-loop saturation — the test build won the middle of the distribution
+(p50 -25%, p75 -49%) while losing both ends (p25 +44%, p95 +45%) — and the log
+explains it exactly:
+
+    capture window (test)  15:29:42.311 -> 15:30:13.290   (31.0 s)
+    Jellyfin Recently Added Scan starts  15:30:00.457     (18.1 s in)
+
+So the last ~13 seconds of that capture ran with a library scan competing for
+the event loop, and it hit **only the test side** — production had been captured
+three minutes earlier, at 15:26:28 -> 15:27:03. Its structural result still
+reproduced exactly (`/request/:id` 30 -> 0) and its aggregate still favoured the
+new build (total wait -33%, calls over 2s 37% -> 20%), but nothing
 percentile-based from it is trustworthy.
 
-The second capture, with no job running, is clean.
+The second capture is clean on both sides — the nearest scan was 185 s before it
+began:
+
+    prod  15:31:37.161 -> 15:32:28.553
+    test  15:33:05.506 -> 15:33:43.438
+
+**Lesson for future rounds:** check the test container's log for scheduled jobs
+overlapping the capture window before trusting any percentile. Download Sync
+runs every 30 s on both sides and is harmless; the library and *arr scans are
+not. Filter with
+`docker logs seerr-test | Select-String "Starting scheduled job" | Select-String -NotMatch "Download Sync"`
+and compare against the HAR's `startedDateTime` range.
 
 ### Whole session
 
