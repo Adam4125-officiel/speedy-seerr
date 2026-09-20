@@ -323,6 +323,58 @@ instructions would have buried all three.
 The two runbooks in `PERF_NOTES.md` — testing an image beside production, and
 rolling back — are written to be followed in this style.
 
+## Deployment state — NOT deployed yet
+
+As of the end of the 2026-09-20 session, **production is still running upstream
+`v3.4.1` and has never been touched.** `v3.4.1-adam.6` is built, pushed and
+verified beside it, but not deployed. Nothing is half-finished; the deployment
+simply had not started when the owner had to stop.
+
+What is already in place:
+
+| | |
+|---|---|
+| production container | `seerr`, port 5055, volume `seerr-data` -> `/app/config` |
+| production image | `ghcr.io/seerr-team/seerr:latest` = **v3.4.1** |
+| managed by | **Docker Compose**, project `seerr`, service `seerr` |
+| compose file | `C:\Users\Adrrrr\seerr\docker-compose.yml` |
+| healthcheck | `wget --spider http://localhost:5055/api/v1/status`, 15s interval, 30s timeout, 20s start period, 3 retries |
+| restart policy | `unless-stopped` |
+| rollback image | pinned as `seerr:rollback`, digest in `C:\seerr-backup\rollback-image-digest.txt` |
+| container inspect | `C:\seerr-backup\seerr-container-inspect.json` |
+| fallback instance | `seerr-test` (stopped) on 5056 with volume `seerr-data-test`, already running adam.6 — the owner wants both kept |
+
+Because it is Compose-managed, deploying is **one `image:` line** plus
+`docker compose up -d`. Do not reconstruct a `docker run`: the healthcheck,
+restart policy, networks and any proxy labels come from that file and would be
+silently lost.
+
+### Where the deployment was interrupted, and what remains
+
+The next steps, in order, each waiting on the owner's output:
+
+1. **Read `C:\Users\Adrrrr\seerr\docker-compose.yml`** before editing it, and
+   copy it to `C:\seerr-backup\`. Three things need checking in it: whether
+   `image:` is pinned to `:latest`; whether any other service could auto-update
+   it (**Watchtower would silently revert the deployment**); and whether the
+   volume is external or Compose-managed, which sets the blast radius of a
+   `docker compose down`.
+2. `docker stop seerr-test` so it is not competing for CPU or the *arr APIs.
+3. **Back up `seerr-data` with `seerr` stopped** — to a second volume *and* a
+   tarball. Copying a live SQLite file yields a corrupt backup.
+4. Verify that backup with `PRAGMA integrity_check` and a migration count
+   **before** trusting it.
+5. Change the `image:` line to `ghcr.io/adam4125-officiel/seerr:v3.4.1-adam.6`,
+   then `docker compose up -d` from `C:\Users\Adrrrr\seerr`.
+6. Watch the three upstream migrations apply, confirm the healthcheck goes
+   healthy, and confirm `/api/v1/status` reports `v3.4.1-adam.6`.
+
+**The rollback constraint is the thing to say out loud before step 5.** Three
+upstream migrations apply on first start, one of which drops a unique
+constraint the older image still expects. Once they have run, **restoring the
+volume is the rollback** — swapping the image back is not sufficient. That is
+why steps 3 and 4 are not optional.
+
 ## Working style
 
 - Work autonomously. Don't stop to ask permission for routine steps.
