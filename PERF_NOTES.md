@@ -182,6 +182,140 @@ One behavioural note: an uninitialised instance now also issues a `/auth/me`
 that it discards, returning 401. That only happens during the setup wizard and
 changes no output.
 
+### 4. `perf(requests): stop refetching request rows the list already returned`
+
+**Problem.** Loading the home page issued ten `/api/v1/request/:id` calls that
+returned data the page already had, inside the same burst as the discover
+sliders and the per-card title lookups.
+
+**Cause.** `RequestCard` and `RequestItem` seed SWR with
+`fallbackData: request` — the object their parent list request just returned —
+and then let SWR revalidate on mount anyway.
+
+**Fix.** `revalidateOnMount: false` on that hook. Approve, decline, retry and
+delete still call `revalidate()` or `mutate()` explicitly, and a request with an
+in-progress download still polls through the existing `refreshInterval`.
+
+**Before / after.** Playwright, seeded home page, median of 5 loads:
+
+| | Before | After |
+|---|---|---|
+| API calls per load | 36 | **26** |
+| median load | 3223 ms | 3055 ms |
+
+Every removed call was a `/api/v1/request/:id`. The load-time change is small
+here because this machine has spare cores; the call count is what matters on a
+saturated single-threaded event loop.
+
+**Risk: low.** No change to what is rendered — the data shown is the same object
+either way.
+
+### 5. `perf(watchlist): only fetch TMDB details when a new media row is needed`
+
+**Problem.** `Watchlist.createWatchlist()` fetched the full movie or show from
+TMDB as its *first* action, then checked whether the entry already existed and
+discarded the result on a duplicate.
+
+**Cause.** The fetched details are used in exactly one place: constructing a
+`Media` row that does not exist yet.
+
+**Fix.** The lookup moved inside that branch, so a duplicate watchlist entry and
+a title already in the library both cost no TMDB call at all.
+
+This is not a rare path. In the owner's production log covering 13.5 hours,
+`"Duplicate request for watchlist blocked"` appears **1002 times** across 142
+distinct titles, arriving in bursts roughly every two hours — a Jellyfin
+watchlist plugin re-posting the whole watchlist, confirmed by the owner. Each of
+those paid for a TMDB fetch and a `structuredClone` of a 170-360 KB payload
+before being rejected.
+
+**Before / after.** 15 duplicate POSTs issued together:
+
+| | Before | After |
+|---|---|---|
+| cold cache | 525.6 ms, **15 TMDB calls** | 214.9 ms, **0 TMDB calls** |
+| warm cache | 301.5 ms, 0 TMDB calls | 182.2 ms, 0 TMDB calls |
+
+**Risk: low.** Duplicates still return 409 and new entries still resolve
+`tmdbId`/`tvdbId` identically. One difference: a duplicate submitted while TMDB
+is unreachable now returns that same 409 instead of a 500, which is the correct
+answer for it.
+
+### 6. `perf(api): drop the JSON round-trip applied to every API response`
+
+**Problem.** Every API response was stringified twice and parsed once.
+
+**Cause.** A middleware replaced `res.json` with one calling
+`JSON.parse(JSON.stringify(json))` before delegating to the real `res.json`,
+which serialises again. Its stated purpose was converting `Date` objects to
+strings ahead of OpenAPI *response* validation — but response validation is not
+enabled anywhere: the validator is configured with `validateRequests: true` and
+nothing sets `validateResponses`. The conversion is also redundant on its own
+terms, since `res.json`'s own `JSON.stringify` applies `Date.prototype.toJSON`
+identically.
+
+**Fix.** Removed the middleware.
+
+**Verification.** Response bodies captured across 31 endpoints (discover, search,
+movie and TV details, seasons, requests, media, users, collections, settings)
+and compared byte for byte: 30 identical. The one that differs,
+`/discover/genreslider/movie`, differs **the same way when the unmodified code is
+compared against itself across two runs**, because it samples live TMDB discover
+results for genre artwork. So the change is byte-identical on every endpoint
+that is reproducible at all.
+
+**Before / after.** CPU profile of the event loop over an identical 30-request
+burst:
+
+| | Before | After |
+|---|---|---|
+| this function's self time | 342 ms (4.7%) | **0 ms** |
+| total sampled CPU | 7246 ms | **6112 ms (-15.6%)** |
+
+Burst wall time, 10 rounds, two runs per arm: 364/372 ms → 338/328 ms
+(**-9.5%**).
+
+**Risk: low.** Byte-identical output, and `res.json(undefined)` — which the
+removed middleware would have thrown a `SyntaxError` on — now behaves normally
+again.
+
+---
+
+## Evidence from the owner's production instance
+
+The owner supplied a HAR capture, server logs, a copy of the SQLite database and
+a `settings.json`. None of it is in the repository; it was read for analysis
+only. What it established:
+
+**The slowness is real and it is server-side.** 77 API calls in a 27.6 second
+session accumulated **92.5 seconds** of `wait` against only 2.5 seconds of
+`blocked`. Returning to the home page fired **25 concurrent API calls**, each
+taking 2.2-3.0 seconds. Most of those returned **`304 Not Modified`** — the
+server did the whole job and then sent nothing, because the work happens before
+the ETag comparison.
+
+The mechanism is event-loop saturation, not any single slow endpoint: each call
+would be fast alone, but Node serves them on one thread. That is why the fixes
+that matter most are the ones that stop calls being made at all (changes 4 and
+5) or cut per-response CPU (change 6).
+
+**Shape of the instance:** Jellyfin (5 libraries), locale `fr`, 1 Radarr,
+1 Sonarr, no Tautulli, `metadataSettings` both `tmdb` — so change 2 applies in
+full. Database: 523 media, 269 requests, 410 seasons, 10 users, which is small
+enough that query shape is not the bottleneck.
+
+**Ruled out:** the container's `/app/config` is a Docker *named volume* on ext4
+inside the Linux VM, not a Windows bind mount, so the SQLite file is not going
+through a 9p/SMB translation layer. Host is a 5600G, VM has 4 vCPU and 10 GB.
+
+**Also seen, not acted on:** `/api/v1/auth/me` was fetched **11 times** in
+27 seconds, once per navigation. `useUser` sets `revalidateOnMount`,
+`revalidateOnFocus` and `revalidateOnReconnect` alongside a 30 s
+`refreshInterval`. Raising `dedupingInterval` to match the refresh interval
+would collapse most of those without weakening the freshness guarantee the
+polling already sets, but it changes how quickly a focus event picks up a
+permission change, so it is left alone pending a decision.
+
 ---
 
 ## Proposed, not implemented
@@ -189,15 +323,18 @@ changes no output.
 Things that would help but break a hard rule, or that measurement did not
 justify.
 
-### Index on `media.tmdbId` + `media.mediaType` for `getRelatedMedia`
+### Index for `getRelatedMedia` — checked, already present, nothing to do
 
 `Media.getRelatedMedia` runs `WHERE media.tmdbId IN (...)` for every discover,
-search, recommendation and similar response, then filters by `mediaType` in JS.
-There is an existing `@Index(['tmdbId', 'mediaType'])` on the entity, so this
-may already be covered; worth confirming against a production-sized table
-before proposing anything. **Blocked by hard rule 1 (no schema changes)** if it
-turns out an index is missing. Not measurable here — the seeded database has
-almost no rows.
+search, recommendation and similar response. The composite index it wants
+already exists in the schema:
+
+    CREATE INDEX "IDX_f8233358694d1677a67899b90a" ON "media" ("tmdbId", "mediaType")
+
+No schema change is needed or proposed. Separately, the owner's production
+database is small enough that query shape is not the bottleneck: 523 `media`,
+269 `media_request`, 410 `season`, 74 `watchlist`, 10 `user`. Database work was
+deprioritised on that evidence.
 
 ### `/discover/genreslider/*` issues ~20 TMDB calls per request
 
@@ -209,16 +346,35 @@ TTL for this endpoint would help, but the result is genre *artwork* that
 changes as titles trend, so a longer TTL is a visible behaviour change.
 **Not implemented** pending a decision from the owner.
 
-### `structuredClone` on every cache read and write
+### `structuredClone` on every cache read and write — the largest single cost
 
-`server/lib/cache.ts` clones on both `get` and `set` because callers mutate what
-they get back (`getTvSeason` rewrites `still_path` in place). Measured cost on
-real payloads: 0.16 ms for a discover page, 2.9 ms for a movie, **4.9 ms for a
-TV show**. Every cache *hit* on a TV detail page therefore blocks the event loop
-for ~5 ms. Removing the clone would be a correctness change (callers would
-share mutable cache state), so it is **not implemented**. A targeted fix —
-cloning only the fields that are actually mutated — is possible but needs an
-audit of every consumer first.
+`server/lib/cache.ts` clones on both `get` and `set`. Measured cost on real
+payloads: 0.16 ms for a discover page, 2.9 ms for a movie, **4.9 ms for a TV
+show**, so every cache *hit* on a TV detail page blocks the event loop for
+~5 ms.
+
+A CPU profile of the event loop over a 30-request burst puts it at **874 ms of
+12.1%**, the largest entry that is not idle, program or GC — and it drives a
+good share of the 500 ms (6.9%) spent in GC, since it allocates 170-360 KB per
+call. Together that is roughly a fifth of event-loop CPU.
+
+It is **not implemented** because both clones are load-bearing. Two callers
+mutate the object they get back from `ExternalAPI.get`:
+
+- `getTvSeason` rewrites `episode.still_path` in place, prefixing an image host.
+  Without the clone this would compound on every cache hit, producing
+  `https://image.tmdb.org/t/p/original/https://image.tmdb.org/...`.
+- `getMovie` assigns `data.videos` when merging English fallback trailers. Without
+  the clone the cached entry would accumulate those trailers, and the
+  `some(video => video.type === 'Trailer')` guard would then stop firing,
+  changing behaviour. This path is especially live for non-English installs; the
+  owner's is `fr`.
+
+The safe route is to make those two call sites build new objects instead of
+mutating, then add an opt-in "no clone" flag to `ExternalAPI.get` used only at
+call sites audited as read-only (the route mappers all construct new objects and
+would qualify). That is a real refactor with a real risk of missing a mutator,
+so it is left as a proposal rather than done blind.
 
 ### 982 KB client chunk — investigated, no action needed
 
@@ -238,22 +394,65 @@ and never on a normal page load. No change made.
 
 Things that cannot be confirmed in this Codespace.
 
-1. **The real size of the ratings win.** This environment is ~10-20 ms from
-   both Rotten Tomatoes and `api.radarr.video`. Measure
-   `/api/v1/movie/:id/ratingscombined` on a cold cache from the real host; the
-   saving should be roughly one full round trip to `api.radarr.video`, so
-   100-300 ms rather than the 20 ms observed here.
+1. **Whether the home-page burst actually shrinks.** The HAR showed 25
+   concurrent calls each taking 2.2-3.0 s. Changes 4 and 6 should cut both the
+   count and the per-response cost. Recapture a HAR of the home page and
+   compare: API call count for the load, and the `wait` total across all
+   `/api/v1/` entries (it was 92.5 s across 77 calls).
 
-2. **The real size of the SSR win.** The single-threaded gain was unmeasurable
-   here because `/api/v1/auth/me` costs ~5-7 ms against a tiny local SQLite
-   file on NVMe. On Postgres over a network, or SQLite on an SD card, the
-   session lookup plus user query is far more expensive and the saving scales
-   with it. Measure `/api/v1/auth/me` in isolation on the real host — that
-   number *is* the per-page-load saving.
+2. **The real size of the ratings win.** This environment is ~10-20 ms from both
+   Rotten Tomatoes and `api.radarr.video`. Measure
+   `/api/v1/movie/:id/ratingscombined` cold from the real host; the saving
+   should be roughly one full round trip to `api.radarr.video`, so 100-300 ms
+   rather than the 20 ms observed here.
 
-3. **Whether `getRelatedMedia` is actually slow at real scale.** The seeded
-   database here has almost no rows. Enable TypeORM query logging and check the
-   query plan for `WHERE media.tmdbId IN (...)` against the real `media` table.
+3. **The watchlist plugin burst.** `"Duplicate request for watchlist blocked"`
+   should still appear in the logs at the same rate — the duplicates are still
+   rejected — but each one should no longer be preceded by a TMDB fetch. Worth
+   confirming the bursts stop showing up as latency spikes for anyone browsing
+   at the time.
 
-4. **Background job timings.** Availability sync and library scans could not be
-   exercised — there is no Plex/Jellyfin/Sonarr/Radarr in this environment.
+4. **The real size of the SSR win.** The single-threaded gain was unmeasurable
+   here because `/api/v1/auth/me` costs ~5-7 ms against a small local SQLite
+   file. Measure `/api/v1/auth/me` in isolation on the real host — that number
+   *is* the per-page-load saving.
+
+5. **Background job timings.** Availability sync and library scans could not be
+   exercised — there is no Jellyfin/Sonarr/Radarr in this environment. The
+   owner's log shows `Download Sync` starting 1617 times in 13.5 hours (every
+   30 s) and `Download Tracker` as the noisiest label at 3234 lines. Its two
+   calls per server are genuinely dependent (`refreshMonitoredDownloads` then
+   `getQueue`), so nothing was changed, but its real cost per run is worth
+   measuring on the host.
+
+6. **`/api/v1/discover/watchlist` was the slowest slider call** in the HAR at
+   1810 ms. Not yet investigated.
+
+---
+
+## CI and Docker
+
+**Upstream publishing workflows are disabled here.** Every job in `release.yml`,
+`preview.yml`, `helm.yml`, `docs-deploy.yml`, `create-tag.yml` and
+`trivy-scan.yml` carries `if: github.repository == 'seerr-team/seerr'`, so none
+of them can run in this fork. Guards were used rather than deleting the files so
+that upstream edits to them keep merging cleanly on rebase. Jobs that already
+had an `if:` have the guard ANDed with the original condition. `ci.yml` and
+`cypress.yml` are untouched — they only run checks and are useful here.
+
+**`fork-image.yml`** is the only workflow in this fork that pushes anything. It
+builds from `adam` (or on manual dispatch), `linux/amd64` only, and pushes to
+`ghcr.io/<owner>/seerr` using `GITHUB_TOKEN` with `packages: write`.
+
+Tags are `vX.Y.Z-adam.N` plus `sha-<short>`; `latest` is never pushed. `N` is
+`github.run_number`, so it increments with each fork build.
+
+`X.Y.Z` is detected as the newest `v*` tag by version order. This matters
+because upstream tags releases on `main`, not on `develop`: `git describe` from
+this branch reports `v1.3.0` (1351 commits back), while the release this fork
+actually sits on is **v3.4.1**. A `base_version` input overrides the detection
+if it ever picks wrong.
+
+The image version reaches the app through the existing `COMMIT_TAG` build arg,
+so the About page reports `develop-v3.4.1-adam.N`. No settings key and no schema
+is involved.

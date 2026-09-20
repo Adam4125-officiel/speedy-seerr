@@ -12,6 +12,41 @@ You are running in a fresh, empty GitHub Codespace. Nothing is preinstalled for 
 
 ---
 
+## Where this stands
+
+Work happens on `adam` (pushed to `origin`). `develop` mirrors upstream and is
+never committed to. `working_branch` is gone, locally and on the remote.
+
+Eight commits so far — six optimisations, all measured, plus the CI work.
+`PERF_NOTES.md` is the source of truth for what changed, the before/after
+numbers, what was investigated and rejected, and what still needs checking on
+the real deployment. **Read it before starting anything.**
+
+The headline finding, from the owner's HAR: the slowness is **event-loop
+saturation**, not one slow endpoint. Returning to the home page fired 25
+concurrent API calls each taking 2.2-3.0 s, with 92.5 s of server `wait` across
+77 calls in a 27.6 s session — most of them returning `304 Not Modified` after
+doing the full work. So the fixes that pay are the ones that stop calls being
+made at all, or cut per-response CPU. Micro-tuning a single handler will not
+show up.
+
+Best remaining leads, in order:
+
+1. **`structuredClone` in `server/lib/cache.ts`** — 12.1% of event-loop CPU plus
+   much of the 6.9% GC, the largest single cost left. Not safe to remove as-is:
+   `getTvSeason` and `getMovie` both mutate what `ExternalAPI.get` returns. The
+   route in `PERF_NOTES.md` is to make those two non-mutating first, then add an
+   opt-in no-clone flag for audited read-only call sites.
+2. **`/api/v1/discover/watchlist`** was the slowest slider call in the HAR at
+   1810 ms. Not yet investigated.
+3. **`/api/v1/auth/me` fetched 11 times in 27 s**, once per navigation. Raising
+   SWR's `dedupingInterval` in `useUser` to match its existing 30 s
+   `refreshInterval` would collapse most of them without weakening the freshness
+   the polling already guarantees — but it changes how fast a focus event picks
+   up a permission change, so it needs a decision first.
+4. **`/discover/genreslider/*`** issues ~20 TMDB calls per request, right at the
+   client's rate-limit cap.
+
 ## Hard rules (never break these)
 
 1. **No database schema changes. Ever.** Do not create, edit or delete migrations. Do not change TypeORM entities in any way that alters the schema (columns, types, relations, indexes, constraints). If an index or schema change would clearly help, **do not implement it**: write it down in `PERF_NOTES.md` under "Proposed, not implemented" with the expected gain.
@@ -31,24 +66,50 @@ You are running in a fresh, empty GitHub Codespace. Nothing is preinstalled for 
 
 ---
 
-## Setup (first session)
+## Setup
 
-1. Read `package.json` (`engines`, `packageManager`, `scripts`) and any `.nvmrc`/`.node-version` to find the right Node and pnpm versions. Install them (e.g. via `nvm` + `corepack enable`). Don't guess versions.
-2. `pnpm install`
-3. Run the full validation suite once (see below) to get a clean baseline **before changing anything**. If something already fails on untouched code, note it in `PERF_NOTES.md` and don't try to fix it unless it blocks you.
-4. Git remotes: `origin` = this fork. Add `upstream` = `https://github.com/seerr-team/seerr.git` if missing.
-5. Read `CONTRIBUTING.md` and the existing code structure (`server/` and `src/`) before optimizing anything.
+The first session already did the groundwork. In a fresh Codespace:
+
+1. **Node 22.19.0** (`engines` requires `^22.19.0` and `.npmrc` sets
+   `engine-strict=true`; the image ships Node 24, which fails install):
+   `export NVM_DIR=/usr/local/share/nvm && . "$NVM_DIR/nvm.sh" && nvm install 22.19.0 && nvm alias default 22.19.0`
+2. **pnpm 10.24.0**: `corepack enable && corepack prepare pnpm@10.24.0 --activate`
+3. `pnpm install`
+4. Run the validation suite once to confirm a clean baseline before changing anything.
+5. Remotes are already set: `origin` = this fork, `upstream` = seerr-team/seerr.
+   Release tags live on `upstream/main`, not `develop`, so fetch with
+   `git fetch upstream --tags` when you need the version.
+6. Read `PERF_NOTES.md` first — it has the baseline, every measurement so far,
+   and what was deliberately left alone. Then `perf/README.md` for the tooling.
+
+### Environment quirks that will bite you
+
+- **Commits need `HUSKY=0`.** `.husky/prepare-commit-msg` runs
+  `exec < /dev/tty && npx cz --hook`, which aborts in a non-interactive shell.
+  `--no-verify` does *not* skip it. Use `HUSKY=0 git commit ...` and run lint,
+  format and tests manually instead.
+- **`pnpm build` can OOM** if a server is also running. Stop it first
+  (`perf/srv.sh stop`) — the box has ~8 GB.
+- `next telemetry disable` (a `postinstall` script) creates an untracked
+  `cache/` directory at the repo root. Leave it; never commit it.
 
 ## Validation (run before every commit)
 
-Use the scripts actually defined in `package.json`. At minimum:
+```bash
+pnpm build          # ~70s   (stop the perf server first, it can OOM)
+pnpm typecheck      # ~33s
+pnpm lint           # must be 0 errors
+pnpm format:check   # prettier; `npx prettier --write <file>` to fix
+pnpm test           # ~165s, 189 tests / 49 suites
+```
 
-- `pnpm build` (must pass)
-- typecheck (`tsc --noEmit` or the repo's script)
-- lint
-- tests, if any exist
+A commit that doesn't pass all of these doesn't get made. Then commit with
+`HUSKY=0 git commit` (see Setup for why).
 
-A commit that doesn't pass all of these doesn't get made.
+Known-clean baseline on untouched code: build, typecheck, format and all 189
+tests pass; lint reports **0 errors and 19 pre-existing warnings**
+(`no-explicit-any`, one `no-console`). If you see 19 warnings, that's expected —
+don't "fix" them, it's churn against upstream.
 
 ---
 
@@ -65,11 +126,41 @@ If the gain isn't measurable or is negligible, revert it. Complexity has to be p
 
 ### About measuring in this Codespace
 
-There is no real Jellyfin/Plex/Sonarr/Radarr here, and no production data. So:
+There is no real Jellyfin/Plex/Sonarr/Radarr here, and no production data. Use
+the harness in `perf/` — it exists so this is repeatable. See `perf/README.md`.
 
-- Where you can run the app, measure locally (you may seed a local test DB with fake data; never use real data).
-- Where you can't, rely on solid evidence instead: counting queries per request (TypeORM logging), counting external calls, profiling isolated functions, analyzing Next.js build output and bundle sizes.
-- For anything that can only be verified on the real deployment, add it to `PERF_NOTES.md` under "To verify in production" with exactly what to measure.
+```bash
+WITH_MIGRATIONS=true pnpm cypress:prepare   # schema + admin@seerr.dev / test1234
+perf/seed-requests.sh                       # synthetic requests, real TMDB ids
+pnpm build && perf/srv.sh start [trace]
+```
+
+Three things that were learned the hard way:
+
+- **This box is ~10-20 ms from TMDB**, against 100-300 ms for a real home
+  server, so wall-clock *understates* the gain of removing an external round
+  trip. Always also record **outbound calls and serialisation waves per
+  request** (`perf/trace-out.cjs`, `perf/bench/run-trace.mjs`) — that number
+  transfers to the real deployment.
+- **Restart the server between A/B arms.** A warm process carries cache state
+  and inflates the baseline; that produced a fake "53% win" once.
+- **Profile before guessing at CPU.** `perf/bench/profile.mjs` found the
+  single biggest win in the codebase (change 6) in one run.
+
+For anything only verifiable on the real deployment, add it to `PERF_NOTES.md`
+under "To verify in production" with exactly what to measure.
+
+### Getting evidence from the owner's instance
+
+The owner runs this in production and can supply real data — a HAR capture of a
+slow page, `config/logs/*.json`, row counts, a redacted `settings.json`. Ask
+when it would settle a question; it has already produced two of the best fixes.
+
+Do this with it: read it **outside the repo tree** (Prettier and ESLint will
+trip over files left inside it), never commit any of it, and keep secrets out of
+`PERF_NOTES.md` and commit messages. Their instance: Jellyfin, locale `fr`,
+1 Radarr, 1 Sonarr, ~523 media / 269 requests / 10 users, Docker Desktop on a
+Hyper-V Windows VM with a named volume for `/app/config`.
 
 ---
 
@@ -87,12 +178,23 @@ Investigate these, but trust your measurements over this list.
 
 ---
 
-## Docker & CI
+## Docker & CI — done, keep it working
 
-- The existing `Dockerfile` must keep building and producing a working image.
-- Disable upstream's GitHub Actions workflows that publish images or releases to upstream's registries (delete them or restrict them so they never run in this fork).
-- Add one workflow that builds the image from the `adam` branch and pushes it to GHCR (`ghcr.io/<owner>/seerr`), **linux/amd64 only**, using `GITHUB_TOKEN` with `packages: write`.
-- Image tags: `vX.Y.Z-adam.N`, where `X.Y.Z` is the upstream version this branch is based on and `N` increments with each fork build. Also push a `sha-<short>` tag. Don't use `latest`.
+This is already set up. Don't redo it; do keep it intact when rebasing.
+
+- Every job in upstream's publishing workflows (`release`, `preview`, `helm`,
+  `docs-deploy`, `create-tag`, `trivy-scan`) carries
+  `if: github.repository == 'seerr-team/seerr'`, so none run here. Guards, not
+  deletions, so upstream edits still merge. `ci.yml`/`cypress.yml` are untouched.
+- `.github/workflows/fork-image.yml` is the **only** workflow here that pushes:
+  from `adam`, linux/amd64 only, to `ghcr.io/<owner>/seerr`, `GITHUB_TOKEN` with
+  `packages: write`. Tags `vX.Y.Z-adam.N` + `sha-<short>`, never `latest`.
+  `N` is `github.run_number`. `X.Y.Z` is the newest `v*` tag by version order —
+  **not** `git describe`, which reports `v1.3.0` from this branch because
+  upstream tags releases on `main`. Current base: **v3.4.1**.
+- The `Dockerfile` must keep building a working image. Verify with:
+  `docker build --build-arg COMMIT_TAG=test -t seerr-check . && docker run --rm -p 5056:5055 seerr-check`
+  then check `/api/v1/status`.
 
 ---
 

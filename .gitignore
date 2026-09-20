@@ -91,3 +91,7 @@ devenv.local.yaml
 
 # pre-commit
 .pre-commit-config.yaml
+
+# perf harness run artifacts
+perf/.run/
+perf/bench/payloads/
