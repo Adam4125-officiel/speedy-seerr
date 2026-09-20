@@ -287,6 +287,42 @@ Keep this file at the repo root, always up to date. Sections:
 - **Proposed, not implemented**: things that would help but break the hard rules (schema changes, behavior changes…).
 - **To verify in production**: what the owner must measure on the real deployment.
 
+## Working with the owner
+
+The owner runs this in production and is the only person who can touch that
+deployment. **Assume they have done nothing since the last session** — no
+rebase, no build, no image pulled, nothing deployed. Do the code work yourself
+first, then bring them in.
+
+When anything has to happen on their machine, **go one step at a time and wait
+for the output before giving the next step.** They asked for this explicitly and
+it has caught real problems: a botched `jq` command, a container that had not
+finished booting, a capture contaminated by a background job. A wall of
+instructions would have buried all three.
+
+- Give **exact, copy-pasteable commands**. They should never have to edit a
+  path, a name or a port.
+- Their environment: **PowerShell**, on a Windows Hyper-V VM, Docker Desktop.
+  Container `seerr` on port 5055, volume `seerr-data` -> `/app/config`, image
+  `ghcr.io/seerr-team/seerr:latest`. A stopped `seerr-test` on 5056 with
+  `seerr-data-test` is kept deliberately as a fallback.
+- **Quoting rule that has cost several attempts:** pass `sh -c` scripts in
+  **double** quotes with **single** quotes inside. Docker's Windows CLI strips
+  inner double quotes, and `\"` is a bash escape PowerShell does not honour.
+  PowerShell continuation is a backtick, not a backslash — prefer one-liners.
+- Say what each step will do before it does it, and what output means success.
+  Tell them plainly when a step is destructive or causes downtime; they can
+  schedule maintenance, but only if they are told in advance.
+- They are a capable operator, not a Seerr developer. Explain *why* a step
+  matters — "stop the container first, copying a live SQLite file gives a
+  corrupt backup" — rather than just issuing it.
+- When they report something odd ("I think a task was running"), **check it
+  against the data** rather than accepting or dismissing it. That specific
+  hunch was right and was confirmed from the container log and HAR timestamps.
+
+The two runbooks in `PERF_NOTES.md` — testing an image beside production, and
+rolling back — are written to be followed in this style.
+
 ## Working style
 
 - Work autonomously. Don't stop to ask permission for routine steps.
