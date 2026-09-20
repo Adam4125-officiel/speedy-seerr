@@ -199,15 +199,14 @@ movieRoutes.get('/:id/ratingscombined', async (req, res, next) => {
       movieId: Number(req.params.id),
     });
 
-    const rtratings = await rtapi.getMovieRatings(
-      movie.title,
-      Number(movie.release_date.slice(0, 4))
-    );
-
-    let imdbRatings;
-    if (movie.imdb_id) {
-      imdbRatings = await imdbApi.getMovieRatings(movie.imdb_id);
-    }
+    // Independent upstreams, so awaiting them in sequence costs a full round trip.
+    const [rtratings, imdbRatings] = await Promise.all([
+      rtapi.getMovieRatings(
+        movie.title,
+        Number(movie.release_date.slice(0, 4))
+      ),
+      movie.imdb_id ? imdbApi.getMovieRatings(movie.imdb_id) : undefined,
+    ]);
 
     if (!rtratings && !imdbRatings) {
       return next({
