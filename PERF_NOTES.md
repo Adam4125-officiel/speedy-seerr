@@ -430,6 +430,46 @@ Things that cannot be confirmed in this Codespace.
 
 ---
 
+## Rolling back to the upstream image
+
+This fork adds **no migrations** and changes no entity columns — `git diff
+origin/develop...adam -- server/migration/` is empty, and the only entity edit
+is a method body in `Watchlist.ts`. So nothing here blocks a rollback.
+
+The complication is upstream's, not this fork's. The image is built from
+`develop`, which is ahead of the release the owner runs
+(`ghcr.io/seerr-team/seerr:latest`, digest
+`sha256:f4768de5f616248d723e05891f3345a1402123775d03bf0890dbfedc0831bda1` as of
+2026-09-20). Their database has 53 migrations applied; this branch carries 55
+sqlite migrations. Three would run on first start:
+
+- `AddUserRequestDeleteCascades1608217312474`
+- `DropPushSubscriptionAuthUnique1786619443939`
+- `RemapOverseerrDeletedStatus1789254652493`
+
+These are one-way. `DropPushSubscriptionAuthUnique` removes a unique constraint
+the older image still expects, so **swapping the image back is not a reliable
+rollback** once they have run. The reliable rollback is restoring the volume
+from a backup taken before the switch.
+
+What that means in practice, and what the owner was given:
+
+1. Pin the current image by digest before switching — `:latest` moves, so
+   re-pulling it later does not necessarily return the same image.
+2. Back up the volume with the container **stopped**; copying a live SQLite file
+   produces a corrupt backup.
+3. Verify the backup with `PRAGMA integrity_check` and a migration count before
+   trusting it.
+4. Roll back by restoring the volume, not by swapping the image alone.
+
+Note also that a test instance started from a copy of the production volume
+inherits the real `settings.json`, so it will talk to the real
+Jellyfin/Sonarr/Radarr and can fire duplicate notifications. Disable the
+notification agents in the copied `settings.json` before starting it. It cannot
+corrupt production data, since it has its own volume.
+
+---
+
 ## CI and Docker
 
 **Upstream publishing workflows are disabled here.** Every job in `release.yml`,
